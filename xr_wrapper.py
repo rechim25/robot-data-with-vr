@@ -1,9 +1,12 @@
 import xr
 import numpy as np
 import ctypes
+import time
 
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileProgram, compileShader
+
+from typing import NamedTuple
 
 
 VERTEX_SHADER_SRC = """
@@ -32,60 +35,77 @@ FRAGMENT_SHADER_SRC = """
     }
     """
 
-#    def frame_loop(self):
-#         attach_session_action_sets(
-#             session=self.session,
-#             attach_info=SessionActionSetsAttachInfo(
-#                 count_action_sets=len(self.action_sets),
-#                 action_sets=(ActionSet * len(self.action_sets))(
-#                     *self.action_sets
-#                 )
-#             ),
-#         )
-#         while True:
-#             window_closed = self.graphics.poll_events()
-#             if window_closed:
-#                 self.exit_render_loop = True
-#                 break
-#             self.exit_render_loop = False
-#             self.poll_xr_events()
-#             if self.exit_render_loop:
-#                 break
-#             if self.session_is_running:
-#                 if self.session_state in (
-#                         SessionState.READY,
-#                         SessionState.SYNCHRONIZED,
-#                         SessionState.VISIBLE,
-#                         SessionState.FOCUSED,
-#                 ):
-#                     frame_state = wait_frame(self.session)
-#                     begin_frame(self.session)
-#                     self.render_layers = []
-#                     self.graphics.make_current()
 
-#                     yield frame_state
+class Position(NamedTuple):
+    x: float
+    y: float
+    z: float
 
-#                     end_frame(
-#                         self.session,
-#                         frame_end_info=FrameEndInfo(
-#                             display_time=frame_state.predicted_display_time,
-#                             environment_blend_mode=self.environment_blend_mode,
-#                             layers=self.render_layers,
-#                         )
-#                     )
-#             else:
-#                 # Throttle loop since xrWaitFrame won't be called.
-#                 time.sleep(0.250)
+
+class Orientation(NamedTuple):
+    w: float
+    x: float
+    y: float
+    z: float
+
+
+class Pose(NamedTuple):
+    position: Position
+    orientation: Orientation
+
+
+class FullPose(NamedTuple):
+    head: Pose | None
+    left_hand: Pose | None
+    right_hand: Pose | None
+
+
+def _round(x, precision=None):
+    return round(x, precision) if precision else x
+
+
+def xr_posef_to_world_pose(pose: xr.Posef, precision=None) -> Pose:
+    """
+        Note: by default we use Local Space reference (see openXR docs) and the unit of measure is meters
+        pose is ovrPosef format: right-handed cartisiaan coordinate system,
+        flat array of 7 floats as follows:
+            1. ovrQuatf: x, y, z, w
+            2. ovrVector3f: x, y, z
+            (-x is forward, z is left, y is up)
+    )
+        In isaac world is (+Z up, +X forward), ros is (+Y up, +Z forward) and usd is (+Y up and -Z forward). Defaults to “world”.
+        In isaac quaternion is w, x, y, z
+    """
+    # Old - for OVRLib conversion
+    # qx_ovr, qy_ovr, qz_ovr, qw_ovr, px_ovr, py_ovr, pz_ovr = pose
+    # orientation = np.array([qw_ovr, qz_ovr, -qx_ovr, qy_ovr])
+    # pos = np.array([pz_ovr, -px_ovr, py_ovr])
+    new_pose = Pose(
+        position=Position(
+            x=_round(pose.position.z, precision),
+            y=_round(-pose.position.x, precision),
+            z=_round(pose.position.y, precision),
+        ),
+        orientation=Orientation(
+            w=_round(pose.orientation.w, precision),
+            x=_round(pose.orientation.z, precision),
+            y=_round(-pose.orientation.x, precision),
+            z=_round(pose.orientation.y, precision),
+        ),
+    )
+    return new_pose
 
 
 class XrWrapper:
-    def __init__(self):
+    def __init__(self, resolution):
+        self.resolution = resolution
         self.context = None
         self.vao = None
         self.shader_program = None
         self.action_spaces = None
         self.found_count = None
         self.frame_state_generator = None
+        self.textures = [None, None]
 
     def __enter__(self):
         self.context = xr.ContextObject(
@@ -95,6 +115,7 @@ class XrWrapper:
         )
         self.context.__enter__()
         self.vao, self.shader_program = self._init_graphics()
+        self._init_textures()
         self.action_spaces = self._create_xr_controller_action_spaces()
         self.found_count = 0
         self.frame_state_generator = self.context.frame_loop()
@@ -154,7 +175,65 @@ class XrWrapper:
 
         glEnable(GL_DEPTH_TEST)
         glClearColor(0.0, 0.0, 0.0, 1.0)
+        # Use the shader program.
+        glUseProgram(shader_program)
         return vao, shader_program
+
+    def _init_textures(self):
+        """Initialize OpenGL textures."""
+        for i in range(2):  # Assuming two eyes: left (0) and right (1)
+            self.textures[i] = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self.textures[i])
+            # Set texture parameters here if needed, e.g., GL_LINEAR filtering.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            # Initialize texture with empty data
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGB,
+                self.resolution[0],
+                self.resolution[1],
+                0,
+                GL_RGB,
+                GL_UNSIGNED_BYTE,
+                None,
+            )
+            glBindTexture(GL_TEXTURE_2D, 0)
+
+    def update_texture(self, texture_idx, rgb_array: np.array):
+        """Update the OpenGL texture with new image data."""
+        height, width, channels = rgb_array.shape
+        glBindTexture(GL_TEXTURE_2D, self.textures[texture_idx])
+        glTexSubImage2D(
+            GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, rgb_array
+        )
+        # Unbind texture for safety
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    def _load_texture_from_rgb_array(self, rgb_array):
+        """Load an image from bytes into an OpenGL texture."""
+        height, width, _ = rgb_array.shape
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGB,
+            width,
+            height,
+            0,
+            GL_RGB,
+            GL_UNSIGNED_BYTE,
+            rgb_array,
+        )
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        return texture
 
     def _create_xr_controller_action_spaces(self) -> list[any]:
         """_summary_
@@ -235,45 +314,26 @@ class XrWrapper:
         ]
         return action_spaces
 
-    def _load_texture_from_rgb_array(self, rgb_array):
-        """Load an image from bytes into an OpenGL texture."""
-        height, width, channels = rgb_array.shape
-        texture = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, texture)
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGB,
-            width,
-            height,
-            0,
-            GL_RGB,
-            GL_UNSIGNED_BYTE,
-            rgb_array,
-        )
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glBindTexture(GL_TEXTURE_2D, 0)
-
-        return texture
-
-    def step(self, rgb_left, rgb_right):
+    def step(self, rgb_left, rgb_right) -> FullPose:
+        head_pose, left_hand_pose, right_hand_pose = None, None, None
         try:
             frame_state = next(self.frame_state_generator)
+            t = time.time()
             for view_index, view in enumerate(self.context.view_loop(frame_state)):
                 # Clear the color and depth buffers.
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-                # Use the shader program.
-                glUseProgram(self.shader_program)
-
                 if view_index == 0:
                     texture = self._load_texture_from_rgb_array(rgb_left)
+                    # self.update_texture(texture_idx=0, rgb_array=rgb_left)
+                    # glBindTexture(GL_TEXTURE_2D, self.textures[0])
                 else:
                     texture = self._load_texture_from_rgb_array(rgb_right)
-
+                    # self.update_texture(texture_idx=1, rgb_array=rgb_right)
+                    # glBindTexture(GL_TEXTURE_2D, self.textures[1])
                 # Bind the appropriate texture.
                 glBindTexture(GL_TEXTURE_2D, texture)
+
                 glUniform1i(
                     glGetUniformLocation(self.shader_program, "screenTexture"), 0
                 )
@@ -285,6 +345,7 @@ class XrWrapper:
 
                 # Unbind the texture.
                 glBindTexture(GL_TEXTURE_2D, 0)
+            print(f"{time.time() - t}")
 
             if self.context.session_state == xr.SessionState.FOCUSED:
                 active_action_set = xr.ActiveActionSet(
@@ -306,13 +367,16 @@ class XrWrapper:
                         base_space=self.context.space,
                         time=frame_state.predicted_display_time,
                     )
-
                     if (
                         space_location.location_flags
                         & xr.SPACE_LOCATION_POSITION_VALID_BIT
                     ):
-                        entity = "Headset" if index == 2 else f"Controller {index + 1}"
-                        print(entity, space_location.pose)
+                        if index == 0:
+                            left_hand_pose = xr_posef_to_world_pose(space_location.pose)
+                        else:
+                            right_hand_pose = xr_posef_to_world_pose(
+                                space_location.pose
+                            )
                         self.found_count += 1
 
                 # Get headset pose
@@ -326,12 +390,76 @@ class XrWrapper:
                 )
                 flags = xr.ViewStateFlags(view_state.view_state_flags)
                 if flags & xr.ViewStateFlags.POSITION_VALID_BIT:
-                    headset_pose = views[xr.Eye.LEFT]
-                    print(headset_pose, flush=True)
-
-                if self.found_count == 0:
-                    print("No headset or controllers active")
-
-                return
+                    left_eye_pose = views[xr.Eye.LEFT].pose
+                    right_eye_pose = views[xr.Eye.RIGHT].pose
+                    head_posef = xr.Posef(
+                        orientation=left_eye_pose.orientation,
+                        position=xr.Vector3f(
+                            x=(left_eye_pose.position.x + right_eye_pose.position.x)
+                            / 2,
+                            y=(left_eye_pose.position.y + right_eye_pose.position.y)
+                            / 2,
+                            z=(left_eye_pose.position.z + right_eye_pose.position.z)
+                            / 2,
+                        ),
+                    )
+                    head_pose = xr_posef_to_world_pose(head_posef, precision=2)
+                    self.found_count += 1
+                # if self.found_count == 0:
+                #     print("No headset or controllers active")
         except StopIteration:
             return None
+        return FullPose(
+            head=head_pose, left_hand=left_hand_pose, right_hand=right_hand_pose
+        )
+
+
+"""
+   For reference:
+   ... from xr.ContextObject ...
+
+   def frame_loop(self):
+        attach_session_action_sets(
+            session=self.session,
+            attach_info=SessionActionSetsAttachInfo(
+                count_action_sets=len(self.action_sets),
+                action_sets=(ActionSet * len(self.action_sets))(
+                    *self.action_sets
+                )
+            ),
+        )
+        while True:
+            window_closed = self.graphics.poll_events()
+            if window_closed:
+                self.exit_render_loop = True
+                break
+            self.exit_render_loop = False
+            self.poll_xr_events()
+            if self.exit_render_loop:
+                break
+            if self.session_is_running:
+                if self.session_state in (
+                        SessionState.READY,
+                        SessionState.SYNCHRONIZED,
+                        SessionState.VISIBLE,
+                        SessionState.FOCUSED,
+                ):
+                    frame_state = wait_frame(self.session)
+                    begin_frame(self.session)
+                    self.render_layers = []
+                    self.graphics.make_current()
+
+                    yield frame_state
+
+                    end_frame(
+                        self.session,
+                        frame_end_info=FrameEndInfo(
+                            display_time=frame_state.predicted_display_time,
+                            environment_blend_mode=self.environment_blend_mode,
+                            layers=self.render_layers,
+                        )
+                    )
+            else:
+                # Throttle loop since xrWaitFrame won't be called.
+                time.sleep(0.250)
+"""
